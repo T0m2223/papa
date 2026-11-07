@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <cassert>
+#include <cmath>
 #include <omp.h>
 #include "helpers.hpp"
 
@@ -33,6 +35,10 @@ unsigned long SequenceInfo::gpsa_sequential(float** S) {
 
 unsigned long SequenceInfo::gpsa_taskloop(float** S, long grain_size=1, int block_size_x=1, int block_size_y=1)
 {
+	assert(grain_size > 0);
+	assert(block_size_x > 0);
+	assert(block_size_y > 0);
+
 	unsigned long visited = 0;
 
 	// copy everything local
@@ -43,16 +49,21 @@ unsigned long SequenceInfo::gpsa_taskloop(float** S, long grain_size=1, int bloc
 	const float mm = mismatch_score;
 	const char* xp = X.data();
 	const char* yp = Y.data();
-	const long  bx = block_size_x;
-	const long  by = block_size_y;
+
+	const long bx = block_size_x;
+	const long by = block_size_y;
 
 	const long num_blocks_x   = (r - 1 + bx - 1) / bx;
 	const long num_blocks_y   = (c - 1 + by - 1) / by;
 	const long num_anti_diags = num_blocks_x + num_blocks_y - 1;
 
+	// grain_size is cells per task; the main loop iterates over blocks.
+	const long block_cells = bx * by;
+	const long main_grain  = std::max(1l, (grain_size + block_cells - 1) / block_cells);
+
 	// configuration vars are firstprivate so every task works on a private copy
 	#pragma omp parallel shared(S, visited, xp, yp) \
-		firstprivate(r, c, gp, ms, mm, bx, by, num_blocks_x, num_blocks_y, num_anti_diags)
+		firstprivate(r, c, gp, ms, mm, bx, by, num_blocks_x, num_blocks_y, num_anti_diags, main_grain)
 	#pragma omp single
 	{
 		// Boundary
@@ -78,7 +89,7 @@ unsigned long SequenceInfo::gpsa_taskloop(float** S, long grain_size=1, int bloc
 
 			#pragma omp taskloop shared(S, xp, yp) \
 				firstprivate(r, c, gp, ms, mm, bx, by, anti_diag, first_block, last_block) \
-				reduction(+:visited) grainsize(grain_size)
+				reduction(+:visited) grainsize(main_grain)
 			for (long block = first_block; block <= last_block; ++block)
 			{
 				const long i0 = 1 + block * bx;
@@ -104,6 +115,10 @@ unsigned long SequenceInfo::gpsa_taskloop(float** S, long grain_size=1, int bloc
 }
 
 unsigned long SequenceInfo::gpsa_tasks(float** S, long grain_size=1, int block_size_x=1, int block_size_y=1) {
+	assert(grain_size > 0);
+	assert(block_size_x > 0);
+	assert(block_size_y > 0);
+
 	unsigned long visited = 0;
 
 	const long  r  = rows;
@@ -113,8 +128,17 @@ unsigned long SequenceInfo::gpsa_tasks(float** S, long grain_size=1, int block_s
 	const float mm = mismatch_score;
 	const char* xp = X.data();
 	const char* yp = Y.data();
-	const long  bx = block_size_x;
-	const long  by = block_size_y;
+
+	// Explicit tasks have no grainsize clause, the block itself is the
+	// task granularity. If only grain_size given (blocks 1x1), use it to
+	// pick a roughly square block: 4096 -> 64x64, 65536 -> 256x256, ...
+	long bx = block_size_x;
+	long by = block_size_y;
+	if (bx == 1 && by == 1 && grain_size > 1)
+	{
+		bx = std::max(1l, (long) std::sqrt((double) grain_size));
+		by = std::max(1l, (grain_size + bx - 1) / bx);
+	}
 
 	const long num_blocks_x = (r - 1 + bx - 1) / bx;
 	const long num_blocks_y = (c - 1 + by - 1) / by;
